@@ -97,11 +97,18 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+enum HttpAuthorization {
+    NotYet { username: String, password: String },
+    Basic(String),
+    Bearer(String),
+}
+
 struct HttpWrapper {
-    /// Value of HTTP Authorization header.
-    authorization: String,
     /// Persistent ureq agent to use for all HTTP requests.
     agent: ureq::Agent,
+
+    /// Value of HTTP Authorization header.
+    authorization: HttpAuthorization,
 }
 
 impl HttpWrapper {
@@ -110,10 +117,7 @@ impl HttpWrapper {
             Some(idx) => &username[..idx],
             None => username,
         };
-        let authorization = format!(
-            "Basic {}",
-            base64::encode(format!("{}:{}", safe_username, password))
-        );
+
         let agent = ureq::AgentBuilder::new()
             .redirect_auth_headers(ureq::RedirectAuthHeaders::SameHost)
             .timeout(Duration::from_secs(timeout))
@@ -121,16 +125,53 @@ impl HttpWrapper {
 
         Self {
             agent,
-            authorization,
+            authorization: HttpAuthorization::NotYet {
+                username: safe_username.to_string(),
+                password: password.to_string(),
+            },
         }
     }
 
-    fn get_session(&self, session_url: &str) -> Result<(String, jmap::Session), ureq::Error> {
-        let response = self
-            .agent
-            .get(session_url)
-            .set("Authorization", &self.authorization)
-            .call()?;
+    fn set_req_authorization(&self, req: ureq::Request) -> ureq::Request {
+        match &self.authorization {
+            HttpAuthorization::NotYet { .. } => req,
+            HttpAuthorization::Basic(v) => req.set("Authorization", &v),
+            HttpAuthorization::Bearer(v) => req.set("Authorization", &v),
+        }
+    }
+
+    fn get_session(&mut self, session_url: &str) -> Result<(String, jmap::Session), ureq::Error> {
+        let response = match self
+            .set_req_authorization(self.agent.get(session_url))
+            .call()
+        {
+            Ok(r) => Ok(r),
+            Err(e) => match e {
+                ureq::Error::Status(code, ref resp) if code == 401 => match &self.authorization {
+                    HttpAuthorization::NotYet { username, password } => {
+                        match resp.header("WWW-Authenticate") {
+                            Some(v) if v.starts_with("Basic") => {
+                                self.authorization = HttpAuthorization::Basic(format!(
+                                    "Basic {}",
+                                    base64::encode(format!("{}:{}", username, password))
+                                ));
+                                self.set_req_authorization(self.agent.get(session_url))
+                                    .call()
+                            }
+                            Some(v) if v.starts_with("Bearer") => {
+                                self.authorization =
+                                    HttpAuthorization::Bearer(format!("Bearer {}", password));
+                                self.set_req_authorization(self.agent.get(session_url))
+                                    .call()
+                            }
+                            _ => Err(e),
+                        }
+                    }
+                    _ => Err(e),
+                },
+                _ => Err(e),
+            },
+        }?;
 
         let session_url = response.get_url().to_string();
         let session: jmap::Session = response.into_json()?;
@@ -139,9 +180,7 @@ impl HttpWrapper {
 
     fn get_reader(&self, url: &str) -> Result<impl Read + Send> {
         Ok(self
-            .agent
-            .get(url)
-            .set("Authorization", &self.authorization)
+            .set_req_authorization(self.agent.get(url))
             .call()
             .context(ReadEmailBlobSnafu {})?
             .into_reader()
@@ -152,9 +191,7 @@ impl HttpWrapper {
 
     fn post_string<D: DeserializeOwned>(&self, url: &str, body: &str) -> Result<D> {
         let post = self
-            .agent
-            .post(url)
-            .set("Authorization", &self.authorization)
+            .set_req_authorization(self.agent.post(url))
             .send_string(body)
             .context(RequestSnafu {})?;
         if log_enabled!(log::Level::Trace) {
@@ -168,9 +205,7 @@ impl HttpWrapper {
 
     fn post_json<S: Serialize, D: DeserializeOwned>(&self, url: &str, body: S) -> Result<D> {
         let post = self
-            .agent
-            .post(url)
-            .set("Authorization", &self.authorization)
+            .set_req_authorization(self.agent.post(url))
             .send_json(body)
             .context(RequestSnafu {})?;
         if log_enabled!(log::Level::Trace) {
@@ -224,7 +259,7 @@ impl Remote {
             .srv_lookup(address.as_str())
             .context(SrvLookupSnafu { address })?;
 
-        let http_wrapper = HttpWrapper::new(username, password, timeout);
+        let mut http_wrapper = HttpWrapper::new(username, password, timeout);
 
         // Try all SRV names in order of priority.
         let mut last_err = None;
@@ -261,7 +296,7 @@ impl Remote {
         password: &str,
         timeout: u64,
     ) -> Result<Self> {
-        let http_wrapper = HttpWrapper::new(username, password, timeout);
+        let mut http_wrapper = HttpWrapper::new(username, password, timeout);
         let (session_url, session) = http_wrapper
             .get_session(session_url)
             .context(OpenSessionSnafu { session_url })?;
